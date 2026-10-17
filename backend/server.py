@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import sys
 import time
 from typing import Any, Literal, Optional
 import uuid
@@ -39,21 +40,43 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 
 # ---------------------------------------------------------
-# Environment & Configuration
+# Logging Configuration
 # ---------------------------------------------------------
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / ".env")
+logger = logging.getLogger("crisisos")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# Accepts standard cloud provider names: MONGO_URL, MONGODB_URL, or MONGO_URI
+# ---------------------------------------------------------
+# Environment & .env Loading
+# ---------------------------------------------------------
+ROOT_DIR = Path(__file__).resolve().parent
+
+# Check backend/.env first, then root .env, then system environment
+if (ROOT_DIR / ".env").is_file():
+    load_dotenv(ROOT_DIR / ".env")
+    logger.info("Loaded environment from %s", ROOT_DIR / ".env")
+elif (ROOT_DIR.parent / ".env").is_file():
+    load_dotenv(ROOT_DIR.parent / ".env")
+    logger.info("Loaded environment from %s", ROOT_DIR.parent / ".env")
+else:
+    load_dotenv()
+    logger.info("Reading configuration directly from system environment")
+
+# MongoDB connection string lookup (supports common cloud host env names)
 mongo_url = (
     os.getenv("MONGO_URL")
     or os.getenv("MONGODB_URL")
     or os.getenv("MONGO_URI")
-    or "mongodb://localhost:27017"
-)
+    or os.getenv("DATABASE_URL")
+    or ""
+).strip()
+
 db_name = os.getenv("DB_NAME", "crisisos")
 
-client = AsyncIOMotorClient(mongo_url)
+if not mongo_url:
+    logger.warning("No MONGO_URL found in environment. Defaulting to local fallback (mongodb://localhost:27017).")
+    mongo_url = "mongodb://localhost:27017"
+
+client: AsyncIOMotorClient = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
 db = client[db_name]
 
 DEMO_MODE = os.getenv("CRISISOS_DEMO_MODE", "true").lower() == "true"
@@ -61,7 +84,7 @@ EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 LLM_PROVIDER = "openai"
 LLM_MODEL = "gpt-5.6-terra"
 LLM_TIMEOUT_SECONDS = 25
-JWT_SECRET = os.getenv("JWT_SECRET", "temporary-secret-change-in-prod")
+JWT_SECRET = os.getenv("JWT_SECRET", "change-this-jwt-secret-in-production")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "720"))
 
@@ -71,9 +94,6 @@ STORAGE_APP_NAME = "crisisos"
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 MEDIA_URL_TTL_SECONDS = 600
 storage_key: str | None = None
-
-logger = logging.getLogger("crisisos")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 Role = Literal["CITIZEN", "RESPONDER", "OPERATOR", "ADMIN", "ORGANIZATION_ADMIN"]
 EmergencyType = Literal[
@@ -92,13 +112,11 @@ _rate_buckets: dict[str, list[float]] = {}
 
 
 def hash_password(password: str) -> str:
-    """Pre-hash password with sha256 to avoid bcrypt 72-byte truncation."""
     digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
     return pwd_context.hash(digest)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify password supporting both legacy bcrypt strings and pre-hashed sha256."""
     digest = hashlib.sha256(plain_password.encode("utf-8")).hexdigest()
     if pwd_context.verify(digest, hashed_password):
         return True
@@ -107,7 +125,6 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 def check_rate_limit(key: str) -> None:
     now = time.time()
-    # Prune old keys occasionally to avoid memory leaks
     if len(_rate_buckets) > 1000:
         for k in list(_rate_buckets.keys()):
             _rate_buckets[k] = [t for t in _rate_buckets[k] if now - t < RATE_WINDOW_SECONDS]
@@ -155,7 +172,6 @@ def get_object(path: str) -> tuple[bytes, str]:
 
 
 def normalize_mobile(value: str) -> str:
-    """Normalize mobile number: keep digits and leading +, strip spaces/dashes/parentheses."""
     value = value.strip()
     if value.startswith("+"):
         return "+" + "".join(ch for ch in value[1:] if ch.isdigit())
@@ -163,7 +179,7 @@ def normalize_mobile(value: str) -> str:
 
 
 # ---------------------------------------------------------
-# Pydantic Models
+# Pydantic Schemas
 # ---------------------------------------------------------
 class SignupRequest(BaseModel):
     name: str = Field(min_length=2, max_length=80)
@@ -236,7 +252,7 @@ class SOSCreate(BaseModel):
     @classmethod
     def validate_location(cls, v: dict[str, Any]) -> dict[str, Any]:
         coords = v.get("coordinates")
-        if coords is not None and len(coords) != 2:
+        if coords is not None and (not isinstance(coords, list) or len(coords) != 2):
             v["coordinates"] = None
         return v
 
@@ -382,7 +398,7 @@ OperatorAssignmentResponse.model_rebuild()
 
 
 # ---------------------------------------------------------
-# Authentication & Helpers
+# Auth & Security Helpers
 # ---------------------------------------------------------
 def make_token(user: dict[str, Any]) -> str:
     now = datetime.now(timezone.utc)
@@ -433,7 +449,7 @@ def require_roles(*allowed: str):
 
 
 # ---------------------------------------------------------
-# Database Seeds & Indexing
+# DB Initialization & Seeding
 # ---------------------------------------------------------
 async def seed_users() -> None:
     seeds = [
@@ -475,7 +491,6 @@ async def seed_responders() -> None:
 async def ensure_indexes() -> None:
     await db.incidents.create_index("created_at")
     await db.incidents.create_index("status")
-    # Sparse index so incidents without valid GPS coordinates are ignored safely
     await db.incidents.create_index([("location.coordinates", "2dsphere")], sparse=True)
     await db.sos.create_index("idempotency_key", unique=True)
     await db.responders.create_index("status")
@@ -495,7 +510,7 @@ async def incident_doc(doc: dict[str, Any]) -> IncidentResponse:
 
 
 # ---------------------------------------------------------
-# WebSocket Management
+# WebSockets
 # ---------------------------------------------------------
 PRIVILEGED_EVENTS = {"responder.location"}
 
@@ -676,24 +691,40 @@ async def assert_media_access(path: str, user: dict[str, Any]) -> dict[str, Any]
 
 
 # ---------------------------------------------------------
-# Lifespan and Routing Setup
+# Lifespan Management
 # ---------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup tasks
+    # Verify MongoDB connection on startup with explicit timeout
+    try:
+        logger.info("Attempting MongoDB connection...")
+        await asyncio.wait_for(db.command("ping"), timeout=5.0)
+        logger.info("MongoDB connected successfully to database '%s'", db_name)
+    except Exception as exc:
+        logger.critical(
+            "FATAL: Could not connect to MongoDB. Current URL: %s. "
+            "Ensure 'MONGO_URL' is set in the Render Dashboard Environment tab. Error: %s",
+            mongo_url.split("@")[-1] if "@" in mongo_url else mongo_url,
+            exc,
+        )
+        raise exc
+
+    # Seed data and build indices
     await ensure_indexes()
     await seed_responders()
     await seed_users()
+
     try:
         await run_in_threadpool(init_storage)
-        logger.info("object storage initialized")
+        logger.info("Object storage initialized")
     except Exception as exc:
-        logger.warning("object storage init failed (uploads will retry on demand): %s", exc)
+        logger.warning("Object storage init deferred (uploads will retry on demand): %s", exc)
 
     yield
 
-    # Shutdown tasks
+    # Graceful shutdown
     client.close()
+    logger.info("Database client closed")
 
 
 app = FastAPI(title="CrisisOS API", version="1.0.0", lifespan=lifespan)
