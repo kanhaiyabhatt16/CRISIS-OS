@@ -6,7 +6,8 @@
     "preview": {
       "distribution": "internal",
       "android": {
-        "buildType": "apk"
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleRelease -Dkotlin.compiler.allWarningsAsErrors=false"
       },
       "env": {
         "EXPO_PUBLIC_BACKEND_URL": "https://crisis-os-yy0s.onrender.com",
@@ -15,7 +16,8 @@
     },
     "production": {
       "android": {
-        "buildType": "apk"
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleRelease -Dkotlin.compiler.allWarningsAsErrors=false"
       },
       "env": {
         "EXPO_PUBLIC_BACKEND_URL": "https://crisis-os-yy0s.onrender.com",
