@@ -9,7 +9,8 @@
         "buildType": "apk"
       },
       "env": {
-        "EXPO_PUBLIC_BACKEND_URL": "https://crisis-os-yy0s.onrender.com"
+        "EXPO_PUBLIC_BACKEND_URL": "https://crisis-os-yy0s.onrender.com",
+        "CI": "false"
       }
     },
     "production": {
@@ -17,7 +18,8 @@
         "buildType": "apk"
       },
       "env": {
-        "EXPO_PUBLIC_BACKEND_URL": "https://crisis-os-yy0s.onrender.com"
+        "EXPO_PUBLIC_BACKEND_URL": "https://crisis-os-yy0s.onrender.com",
+        "CI": "false"
       }
     }
   },
