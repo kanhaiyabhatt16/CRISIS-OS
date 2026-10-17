@@ -12,22 +12,18 @@
       "android": {
         "buildType": "apk"
       },
-      "yarn": {
-        "frozenLockfile": false
-      },
       "env": {
-        "EXPO_PUBLIC_BACKEND_URL": "https://crisis-os-yy0s.onrender.com"
+        "EXPO_PUBLIC_BACKEND_URL": "https://crisis-os-yy0s.onrender.com",
+        "YARN_ENABLE_IMMUTABLE_INSTALLS": "false"
       }
     },
     "production": {
       "android": {
         "buildType": "apk"
       },
-      "yarn": {
-        "frozenLockfile": false
-      },
       "env": {
-        "EXPO_PUBLIC_BACKEND_URL": "https://crisis-os-yy0s.onrender.com"
+        "EXPO_PUBLIC_BACKEND_URL": "https://crisis-os-yy0s.onrender.com",
+        "YARN_ENABLE_IMMUTABLE_INSTALLS": "false"
       }
     }
   },
