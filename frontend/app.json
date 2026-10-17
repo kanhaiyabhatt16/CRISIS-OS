@@ -7,7 +7,12 @@
     "icon": "./assets/images/icon.png",
     "scheme": "frontend",
     "userInterfaceStyle": "automatic",
-    "extra": {},
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "65cec834-0732-4098-aaf2-40bbb56c75ee"
+      }
+    },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.emergent.crisisai.r45r8y"
@@ -17,7 +22,12 @@
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#000000"
       },
-      "package": "com.emergent.crisisai.r45r8y"
+      "package": "com.emergent.crisisai.r45r8y",
+      "permissions": [
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.RECORD_AUDIO"
+      ]
     },
     "web": {
       "bundler": "metro",
