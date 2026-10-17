@@ -488,22 +488,44 @@ async def seed_responders() -> None:
     await db.responders.insert_many(responders)
 
 
-async def ensure_indexes() -> None:
-    await db.incidents.create_index("created_at")
-    await db.incidents.create_index("status")
-    await db.incidents.create_index([("location.coordinates", "2dsphere")], sparse=True)
-    await db.sos.create_index("idempotency_key", unique=True)
-    await db.responders.create_index("status")
-    await db.assignments.create_index("status")
-    await db.audit_logs.create_index("created_at")
-    await db.users.create_index("email", unique=True)
-    await db.alerts.create_index("active")
-    await db.media.create_index("storage_path", unique=True)
-    await db.operator_assignments.create_index("operator_id")
-    await db.operator_assignments.create_index("status")
-    await db.operator_locations.create_index("operator_id", unique=True)
-    await db.operator_locations.create_index([("location.coordinates", "2dsphere")], sparse=True)
+async def safe_create_index(collection, keys, **kwargs):
+    """Creates index; if an old incompatible index exists, drops and recreates it."""
+    try:
+        await collection.create_index(keys, **kwargs)
+    except OperationFailure as exc:
+        if exc.code == 86 or "IndexKeySpecsConflict" in str(exc):
+            logger.warning("Index conflict on %s; dropping and rebuilding...", keys)
+            index_name = kwargs.get("name")
+            if not index_name:
+                if isinstance(keys, list):
+                    index_name = "_".join([f"{k}_{v}" for k, v in keys])
+                else:
+                    index_name = f"{keys}_1"
+            try:
+                await collection.drop_index(index_name)
+                await collection.create_index(keys, **kwargs)
+                logger.info("Successfully recreated index: %s", index_name)
+            except Exception as drop_err:
+                logger.error("Failed to drop/recreate index %s: %s", index_name, drop_err)
+        else:
+            raise exc
 
+
+async def ensure_indexes() -> None:
+    await safe_create_index(db.incidents, "created_at")
+    await safe_create_index(db.incidents, "status")
+    await safe_create_index(db.incidents, [("location.coordinates", "2dsphere")], sparse=True)
+    await safe_create_index(db.sos, "idempotency_key", unique=True)
+    await safe_create_index(db.responders, "status")
+    await safe_create_index(db.assignments, "status")
+    await safe_create_index(db.audit_logs, "created_at")
+    await safe_create_index(db.users, "email", unique=True)
+    await safe_create_index(db.alerts, "active")
+    await safe_create_index(db.media, "storage_path", unique=True)
+    await safe_create_index(db.operator_assignments, "operator_id")
+    await safe_create_index(db.operator_assignments, "status")
+    await safe_create_index(db.operator_locations, "operator_id", unique=True)
+    await safe_create_index(db.operator_locations, [("location.coordinates", "2dsphere")], sparse=True)
 
 async def incident_doc(doc: dict[str, Any]) -> IncidentResponse:
     return IncidentResponse(**doc)
