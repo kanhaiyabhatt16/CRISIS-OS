@@ -3,11 +3,12 @@
     "version": ">= 12.0.0"
   },
   "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    },
     "preview": {
       "distribution": "internal",
-      "npm": {
-        "installCommand": "npm install --legacy-peer-deps"
-      },
       "android": {
         "buildType": "apk"
       },
@@ -16,9 +17,6 @@
       }
     },
     "production": {
-      "npm": {
-        "installCommand": "npm install --legacy-peer-deps"
-      },
       "android": {
         "buildType": "apk"
       },
