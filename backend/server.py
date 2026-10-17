@@ -1,43 +1,67 @@
 from __future__ import annotations
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Literal, Optional
+
 import asyncio
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import secrets
 import time
+from typing import Any, Literal, Optional
 import uuid
 
-import jwt
-import requests
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+import jwt
 from motor.motor_asyncio import AsyncIOMotorClient
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field, field_validator
+import requests
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 
-
+# ---------------------------------------------------------
+# Environment & Configuration
+# ---------------------------------------------------------
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-mongo_url = os.environ["MONGO_URL"]
+# Accepts standard cloud provider names: MONGO_URL, MONGODB_URL, or MONGO_URI
+mongo_url = (
+    os.getenv("MONGO_URL")
+    or os.getenv("MONGODB_URL")
+    or os.getenv("MONGO_URI")
+    or "mongodb://localhost:27017"
+)
+db_name = os.getenv("DB_NAME", "crisisos")
+
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ["DB_NAME"]]
+db = client[db_name]
+
 DEMO_MODE = os.getenv("CRISISOS_DEMO_MODE", "true").lower() == "true"
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 LLM_PROVIDER = "openai"
 LLM_MODEL = "gpt-5.6-terra"
 LLM_TIMEOUT_SECONDS = 25
-JWT_SECRET = os.environ["JWT_SECRET"]
+JWT_SECRET = os.getenv("JWT_SECRET", "temporary-secret-change-in-prod")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "720"))
 
@@ -48,8 +72,6 @@ MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 MEDIA_URL_TTL_SECONDS = 600
 storage_key: str | None = None
 
-app = FastAPI(title="CrisisOS API", version="1.0.0")
-api_router = APIRouter(prefix="/api")
 logger = logging.getLogger("crisisos")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -69,8 +91,29 @@ RATE_MAX_ATTEMPTS = 10
 _rate_buckets: dict[str, list[float]] = {}
 
 
+def hash_password(password: str) -> str:
+    """Pre-hash password with sha256 to avoid bcrypt 72-byte truncation."""
+    digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return pwd_context.hash(digest)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify password supporting both legacy bcrypt strings and pre-hashed sha256."""
+    digest = hashlib.sha256(plain_password.encode("utf-8")).hexdigest()
+    if pwd_context.verify(digest, hashed_password):
+        return True
+    return pwd_context.verify(plain_password[:72], hashed_password)
+
+
 def check_rate_limit(key: str) -> None:
     now = time.time()
+    # Prune old keys occasionally to avoid memory leaks
+    if len(_rate_buckets) > 1000:
+        for k in list(_rate_buckets.keys()):
+            _rate_buckets[k] = [t for t in _rate_buckets[k] if now - t < RATE_WINDOW_SECONDS]
+            if not _rate_buckets[k]:
+                _rate_buckets.pop(k, None)
+
     attempts = [t for t in _rate_buckets.get(key, []) if now - t < RATE_WINDOW_SECONDS]
     if len(attempts) >= RATE_MAX_ATTEMPTS:
         raise HTTPException(status_code=429, detail="Too many attempts — try again in a few minutes")
@@ -94,7 +137,12 @@ def init_storage() -> str:
 
 def put_object(path: str, data: bytes, content_type: str) -> dict[str, Any]:
     key = init_storage()
-    resp = requests.put(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key, "Content-Type": content_type}, data=data, timeout=120)
+    resp = requests.put(
+        f"{STORAGE_URL}/objects/{path}",
+        headers={"X-Storage-Key": key, "Content-Type": content_type},
+        data=data,
+        timeout=120,
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -114,17 +162,20 @@ def normalize_mobile(value: str) -> str:
     return "".join(ch for ch in value if ch.isdigit())
 
 
+# ---------------------------------------------------------
+# Pydantic Models
+# ---------------------------------------------------------
 class SignupRequest(BaseModel):
     name: str = Field(min_length=2, max_length=80)
     email: EmailStr
     password: str = Field(min_length=12, max_length=128)
     mobile_number: str = Field(min_length=10, max_length=20)
-    
+
     @field_validator("mobile_number", mode="before")
     @classmethod
     def _normalize_mobile(cls, v: str) -> str:
         return normalize_mobile(v)
-    
+
     @field_validator("mobile_number")
     @classmethod
     def _validate_mobile(cls, v: str) -> str:
@@ -153,10 +204,194 @@ class TokenResponse(BaseModel):
     user: AuthUser
 
 
+class DemoLoginRequest(BaseModel):
+    role: Role
+
+
+class DemoSession(BaseModel):
+    user_id: str
+    name: str
+    role: Role
+    organization_id: str
+    demo_mode: bool
+
+
+class SOSCreate(BaseModel):
+    emergency_type: EmergencyType = "GENERAL"
+    description: str = ""
+    affected_people: int = Field(default=1, ge=1, le=500)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+    location: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "type": "Point",
+            "coordinates": None,
+            "source": "UNKNOWN",
+            "accuracy": None,
+            "timestamp": now_iso(),
+        }
+    )
+    media_paths: list[str] = Field(default_factory=list, max_length=4)
+
+    @field_validator("location")
+    @classmethod
+    def validate_location(cls, v: dict[str, Any]) -> dict[str, Any]:
+        coords = v.get("coordinates")
+        if coords is not None and len(coords) != 2:
+            v["coordinates"] = None
+        return v
+
+
+class DispatchApproval(BaseModel):
+    responder_id: str
+
+
+class AssignmentStatusUpdate(BaseModel):
+    status: AssignmentStatus
+    note: str = ""
+
+
+class ResponderStatusUpdate(BaseModel):
+    status: Literal["AVAILABLE", "BUSY", "OFFLINE", "EN_ROUTE", "ON_SCENE"]
+
+
+class ResponderLocationUpdate(BaseModel):
+    location: dict[str, Any]
+
+
+class OperatorAssignmentStatus(BaseModel):
+    status: Literal["ASSIGNED", "EN_ROUTE", "ON_SCENE", "COMPLETED", "CANCELLED"]
+    note: str = ""
+
+
+class OperatorLocationUpdate(BaseModel):
+    location: dict[str, Any]
+
+
+class OperatorAssignmentCreate(BaseModel):
+    incident_id: str
+
+
+class AlertCreate(BaseModel):
+    title: str = Field(min_length=3, max_length=120)
+    message: str = Field(min_length=3, max_length=1000)
+    severity: AlertSeverity = "WARNING"
+    radius_km: float | None = Field(default=None, ge=0.5, le=200)
+
+
+class AlertResponse(BaseModel):
+    id: str
+    title: str
+    message: str
+    severity: str
+    radius_km: float | None = None
+    created_by: str
+    created_at: str
+    active: bool = True
+
+
+class IncidentResponse(BaseModel):
+    id: str
+    sos_id: str
+    title: str
+    description: str
+    type: EmergencyType
+    status: str
+    severity: str
+    location: dict[str, Any]
+    affected_people: int
+    ai_analysis: dict[str, Any]
+    media: list[dict[str, Any]] = []
+    reported_by: str | None = None
+    reported_by_mobile: str | None = None
+    assigned_responder_id: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class OperatorAssignmentResponse(BaseModel):
+    id: str
+    operator_id: str
+    operator_name: str
+    incident_id: str
+    citizen_id: str
+    citizen_name: str
+    status: str
+    assigned_at: str
+    updated_at: str
+    note: str = ""
+    incident: Optional[IncidentResponse] = None
+
+
+class NearestIncidentResponse(BaseModel):
+    id: str
+    sos_id: str
+    title: str
+    description: str
+    type: EmergencyType
+    status: str
+    severity: str
+    location: dict[str, Any]
+    affected_people: int
+    ai_analysis: dict[str, Any]
+    media: list[dict[str, Any]] = []
+    reported_by: str | None = None
+    reported_by_name: str | None = None
+    reported_by_mobile: str | None = None
+    created_at: str
+    distance_km: float
+
+
+class LocateCitizenResponse(BaseModel):
+    success: bool
+    message: str
+
+
+class ResponderResponse(BaseModel):
+    id: str
+    name: str
+    team: str
+    skills: list[str]
+    status: str
+    distance_km: float
+    current_location: dict[str, Any] | None = None
+    location_history: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AssignmentResponse(BaseModel):
+    id: str
+    incident_id: str
+    responder_id: str
+    responder_name: str
+    status: str
+    approved_by: str
+    assigned_at: str
+    updated_at: str
+    note: str = ""
+
+
+class AuditResponse(BaseModel):
+    id: str
+    action: str
+    actor: str
+    target_id: str
+    detail: str
+    created_at: str
+
+
+OperatorAssignmentResponse.model_rebuild()
+
+
+# ---------------------------------------------------------
+# Authentication & Helpers
+# ---------------------------------------------------------
 def make_token(user: dict[str, Any]) -> str:
-    from datetime import timedelta
     now = datetime.now(timezone.utc)
-    return jwt.encode({"sub": user["id"], "role": user["role"], "iat": now}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    exp = now + timedelta(minutes=JWT_EXPIRE_MINUTES)
+    return jwt.encode(
+        {"sub": user["id"], "role": user["role"], "iat": now, "exp": exp},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
 
 
 def auth_user(doc: dict[str, Any]) -> AuthUser:
@@ -197,6 +432,9 @@ def require_roles(*allowed: str):
     return guard
 
 
+# ---------------------------------------------------------
+# Database Seeds & Indexing
+# ---------------------------------------------------------
 async def seed_users() -> None:
     seeds = [
         ("citizen@crisisos.app", "DEMO_CITIZEN_PASSWORD", "Maya Rao", "CITIZEN", "+15551234567"),
@@ -206,180 +444,59 @@ async def seed_users() -> None:
     ]
     default_password = "CrisisOS2026!"
     for email, env_key, name, role, mobile in seeds:
-        password = os.environ.get(env_key)
-        if password:
-            password = password[:72]
+        password = os.environ.get(env_key) or default_password
         existing = await db.users.find_one({"email": email})
         if existing:
             continue
         await db.users.insert_one({
-            "id": str(uuid.uuid4()), "email": email, "name": name, "role": role,
-            "password_hash": pwd_context.hash(password or default_password),
-            "organization_id": "crisisos-demo", "disabled": False, "created_at": now_iso(),
+            "id": str(uuid.uuid4()),
+            "email": email,
+            "name": name,
+            "role": role,
+            "password_hash": hash_password(password),
+            "organization_id": "crisisos-demo",
+            "disabled": False,
+            "created_at": now_iso(),
             "mobile_number": mobile,
         })
 
 
-class DemoLoginRequest(BaseModel):
-    role: Role
+async def seed_responders() -> None:
+    if await db.responders.count_documents({}) > 0:
+        return
+    responders = [
+        {"id": "responder-alpha", "name": "Alpha Rescue Team", "team": "Urban Search & Rescue", "skills": ["BUILDING_RESCUE", "FIRST_AID"], "status": "AVAILABLE", "distance_km": 1.8, "current_location": None},
+        {"id": "responder-bravo", "name": "Bravo Medical Unit", "team": "Emergency Medical", "skills": ["FIRST_AID", "MEDICAL"], "status": "AVAILABLE", "distance_km": 3.4, "current_location": None},
+        {"id": "responder-charlie", "name": "Charlie Response", "team": "General Response", "skills": ["EVACUATION", "FIRST_AID"], "status": "AVAILABLE", "distance_km": 5.7, "current_location": None},
+    ]
+    await db.responders.insert_many(responders)
 
 
-class DemoSession(BaseModel):
-    user_id: str
-    name: str
-    role: Role
-    organization_id: str
-    demo_mode: bool
+async def ensure_indexes() -> None:
+    await db.incidents.create_index("created_at")
+    await db.incidents.create_index("status")
+    # Sparse index so incidents without valid GPS coordinates are ignored safely
+    await db.incidents.create_index([("location.coordinates", "2dsphere")], sparse=True)
+    await db.sos.create_index("idempotency_key", unique=True)
+    await db.responders.create_index("status")
+    await db.assignments.create_index("status")
+    await db.audit_logs.create_index("created_at")
+    await db.users.create_index("email", unique=True)
+    await db.alerts.create_index("active")
+    await db.media.create_index("storage_path", unique=True)
+    await db.operator_assignments.create_index("operator_id")
+    await db.operator_assignments.create_index("status")
+    await db.operator_locations.create_index("operator_id", unique=True)
+    await db.operator_locations.create_index([("location.coordinates", "2dsphere")], sparse=True)
 
 
-class SOSCreate(BaseModel):
-    emergency_type: EmergencyType = "GENERAL"
-    description: str = ""
-    affected_people: int = Field(default=1, ge=1, le=500)
-    idempotency_key: str = Field(min_length=8, max_length=120)
-    location: dict[str, Any] = Field(default_factory=lambda: {
-        "type": "Point", "coordinates": [], "source": "UNKNOWN", "accuracy": None, "timestamp": now_iso()
-    })
-    media_paths: list[str] = Field(default_factory=list, max_length=4)
+async def incident_doc(doc: dict[str, Any]) -> IncidentResponse:
+    return IncidentResponse(**doc)
 
 
-class DispatchApproval(BaseModel):
-    responder_id: str
-
-
-class AssignmentStatusUpdate(BaseModel):
-    status: AssignmentStatus
-    note: str = ""
-
-
-class ResponderStatusUpdate(BaseModel):
-    status: Literal["AVAILABLE", "BUSY", "OFFLINE", "EN_ROUTE", "ON_SCENE"]
-
-
-class ResponderLocationUpdate(BaseModel):
-    location: dict[str, Any]
-
-
-class OperatorAssignmentStatus(BaseModel):
-    status: Literal["ASSIGNED", "EN_ROUTE", "ON_SCENE", "COMPLETED", "CANCELLED"]
-    note: str = ""
-
-
-class OperatorLocationUpdate(BaseModel):
-    location: dict[str, Any]
-
-
-class OperatorAssignmentCreate(BaseModel):
-    incident_id: str
-
-
-class OperatorAssignmentResponse(BaseModel):
-    id: str
-    operator_id: str
-    operator_name: str
-    incident_id: str
-    citizen_id: str
-    citizen_name: str
-    status: str
-    assigned_at: str
-    updated_at: str
-    note: str = ""
-    incident: Optional["IncidentResponse"] = None
-
-
-class NearestIncidentResponse(BaseModel):
-    id: str
-    sos_id: str
-    title: str
-    description: str
-    type: EmergencyType
-    status: str
-    severity: str
-    location: dict[str, Any]
-    affected_people: int
-    ai_analysis: dict[str, Any]
-    media: list[dict[str, Any]] = []
-    reported_by: str | None = None
-    reported_by_name: str | None = None
-    reported_by_mobile: str | None = None
-    created_at: str
-    distance_km: float
-
-
-class LocateCitizenResponse(BaseModel):
-    success: bool
-    message: str
-
-
-class AlertCreate(BaseModel):
-    title: str = Field(min_length=3, max_length=120)
-    message: str = Field(min_length=3, max_length=1000)
-    severity: AlertSeverity = "WARNING"
-    radius_km: float | None = Field(default=None, ge=0.5, le=200)
-
-
-class AlertResponse(BaseModel):
-    id: str
-    title: str
-    message: str
-    severity: str
-    radius_km: float | None = None
-    created_by: str
-    created_at: str
-    active: bool = True
-
-
-class IncidentResponse(BaseModel):
-    id: str
-    sos_id: str
-    title: str
-    description: str
-    type: EmergencyType
-    status: str
-    severity: str
-    location: dict[str, Any]
-    affected_people: int
-    ai_analysis: dict[str, Any]
-    media: list[dict[str, Any]] = []
-    reported_by: str | None = None
-    reported_by_mobile: str | None = None
-    assigned_responder_id: str | None = None
-    created_at: str
-    updated_at: str
-
-
-class ResponderResponse(BaseModel):
-    id: str
-    name: str
-    team: str
-    skills: list[str]
-    status: str
-    distance_km: float
-    current_location: dict[str, Any] | None = None
-    location_history: list[dict[str, Any]] = Field(default_factory=list)
-
-
-class AssignmentResponse(BaseModel):
-    id: str
-    incident_id: str
-    responder_id: str
-    responder_name: str
-    status: str
-    approved_by: str
-    assigned_at: str
-    updated_at: str
-    note: str = ""
-
-
-class AuditResponse(BaseModel):
-    id: str
-    action: str
-    actor: str
-    target_id: str
-    detail: str
-    created_at: str
-
-
+# ---------------------------------------------------------
+# WebSocket Management
+# ---------------------------------------------------------
 PRIVILEGED_EVENTS = {"responder.location"}
 
 
@@ -423,29 +540,9 @@ async def broadcast(event_type: str, payload: dict[str, Any], target_user_id: st
         logger.warning("broadcast failed: %s", exc)
 
 
-@api_router.websocket("/ws")
-async def events_ws(websocket: WebSocket, token: str | None = Query(default=None)) -> None:
-    try:
-        payload = jwt.decode(token or "", JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user = await db.users.find_one({"id": payload.get("sub")}, {"_id": 0, "id": 1, "role": 1, "disabled": 1})
-        if not user or user.get("disabled", False):
-            raise ValueError("unknown user")
-        role = str(user.get("role", "CITIZEN"))
-    except Exception:
-        await websocket.close(code=4401)
-        return
-    await manager.connect(websocket, role, user["id"])
-    try:
-        while True:
-            message = await websocket.receive_text()
-            if message == "ping":
-                await websocket.send_text(json.dumps({"type": "pong", "payload": {}, "at": now_iso()}))
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-    except Exception:
-        manager.disconnect(websocket)
-
-
+# ---------------------------------------------------------
+# Triage AI / Deterministic Fallback
+# ---------------------------------------------------------
 ALLOWED_TYPES = {"GENERAL", "TRAPPED_PERSON", "MEDICAL", "FIRE", "FLOOD", "ACCIDENT", "BUILDING_COLLAPSE", "MISSING_PERSON", "OTHER"}
 ALLOWED_SEVERITIES = {"LOW", "MODERATE", "HIGH", "CRITICAL"}
 ALLOWED_CAPABILITIES = {"BUILDING_RESCUE", "FIRST_AID", "MEDICAL", "EVACUATION", "FIRE_SUPPRESSION", "SEARCH_RESCUE"}
@@ -478,7 +575,7 @@ def analysis_for(sos: SOSCreate) -> dict[str, Any]:
         "people_count": sos.affected_people,
         "required_capabilities": required,
         "summary": summary,
-        "risks": ["Structural instability", "Delayed access" ] if trapped else ["Situation may escalate"],
+        "risks": ["Structural instability", "Delayed access"] if trapped else ["Situation may escalate"],
         "confidence": 0.96 if trapped else 0.84,
         "provider": "deterministic-safety-provider",
         "human_approval_required": True,
@@ -486,8 +583,6 @@ def analysis_for(sos: SOSCreate) -> dict[str, Any]:
 
 
 async def llm_analysis(sos: SOSCreate) -> dict[str, Any] | None:
-    """LLM triage via the Emergent universal key. Returns None on any failure so
-    the caller falls back to the deterministic safety provider."""
     if not EMERGENT_LLM_KEY:
         return None
     try:
@@ -563,45 +658,84 @@ async def audit(action: str, actor: str, target_id: str, detail: str) -> None:
     })
 
 
-async def ensure_indexes() -> None:
-    await db.incidents.create_index("created_at")
-    await db.incidents.create_index("status")
-    await db.incidents.create_index([("location.coordinates", "2dsphere")])
-    await db.sos.create_index("idempotency_key", unique=True)
-    await db.responders.create_index("status")
-    await db.assignments.create_index("status")
-    await db.audit_logs.create_index("created_at")
-    await db.users.create_index("email", unique=True)
-    await db.alerts.create_index("active")
-    await db.media.create_index("storage_path", unique=True)
-    await db.operator_assignments.create_index("operator_id")
-    await db.operator_assignments.create_index("status")
-    await db.operator_locations.create_index("operator_id", unique=True)
+def sign_media_path(path: str) -> dict[str, Any]:
+    expires = int(time.time()) + MEDIA_URL_TTL_SECONDS
+    signature = hmac.new(JWT_SECRET.encode(), f"{path}:{expires}".encode(), hashlib.sha256).hexdigest()[:40]
+    return {"url": f"/api/files/{path}?mt={signature}&exp={expires}", "expires_at": expires}
 
 
-async def seed_responders() -> None:
-    if await db.responders.count_documents({}) > 0:
+async def assert_media_access(path: str, user: dict[str, Any]) -> dict[str, Any]:
+    media = await db.media.find_one({"storage_path": path}, {"_id": 0})
+    if not media:
+        raise HTTPException(status_code=404, detail="File not found")
+    if user.get("role") == "CITIZEN" and media.get("owner_id") != user["id"]:
+        attached = await db.incidents.find_one({"media.path": path, "reported_by": user["id"]})
+        if not attached:
+            raise HTTPException(status_code=403, detail="Insufficient permissions")
+    return media
+
+
+# ---------------------------------------------------------
+# Lifespan and Routing Setup
+# ---------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup tasks
+    await ensure_indexes()
+    await seed_responders()
+    await seed_users()
+    try:
+        await run_in_threadpool(init_storage)
+        logger.info("object storage initialized")
+    except Exception as exc:
+        logger.warning("object storage init failed (uploads will retry on demand): %s", exc)
+
+    yield
+
+    # Shutdown tasks
+    client.close()
+
+
+app = FastAPI(title="CrisisOS API", version="1.0.0", lifespan=lifespan)
+api_router = APIRouter(prefix="/api")
+
+
+# ---------------------------------------------------------
+# API Endpoints
+# ---------------------------------------------------------
+@api_router.websocket("/ws")
+async def events_ws(websocket: WebSocket, token: str | None = Query(default=None)) -> None:
+    try:
+        payload = jwt.decode(token or "", JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user = await db.users.find_one({"id": payload.get("sub")}, {"_id": 0, "id": 1, "role": 1, "disabled": 1})
+        if not user or user.get("disabled", False):
+            raise ValueError("unknown user")
+        role = str(user.get("role", "CITIZEN"))
+    except Exception:
+        await websocket.close(code=4401)
         return
-    responders = [
-        {"id": "responder-alpha", "name": "Alpha Rescue Team", "team": "Urban Search & Rescue", "skills": ["BUILDING_RESCUE", "FIRST_AID"], "status": "AVAILABLE", "distance_km": 1.8, "current_location": None},
-        {"id": "responder-bravo", "name": "Bravo Medical Unit", "team": "Emergency Medical", "skills": ["FIRST_AID", "MEDICAL"], "status": "AVAILABLE", "distance_km": 3.4, "current_location": None},
-        {"id": "responder-charlie", "name": "Charlie Response", "team": "General Response", "skills": ["EVACUATION", "FIRST_AID"], "status": "AVAILABLE", "distance_km": 5.7, "current_location": None},
-    ]
-    await db.responders.insert_many(responders)
-
-
-async def incident_doc(doc: dict[str, Any]) -> IncidentResponse:
-    return IncidentResponse(**doc)
+    await manager.connect(websocket, role, user["id"])
+    try:
+        while True:
+            message = await websocket.receive_text()
+            if message == "ping":
+                await websocket.send_text(json.dumps({"type": "pong", "payload": {}, "at": now_iso()}))
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception:
+        manager.disconnect(websocket)
 
 
 @app.get("/health")
 async def health_root() -> dict[str, str]:
     return {"status": "ok", "service": "crisisos-api"}
 
+
 @app.get("/v1/models")
 @app.head("/v1/models")
 async def v1_models() -> dict[str, list]:
     return {"data": []}
+
 
 @api_router.get("/health")
 async def health() -> dict[str, str]:
@@ -621,9 +755,14 @@ async def signup(input: SignupRequest, request: Request) -> TokenResponse:
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=409, detail="Email already registered")
     doc = {
-        "id": str(uuid.uuid4()), "email": email, "name": input.name.strip(), "role": "CITIZEN",
-        "password_hash": pwd_context.hash(input.password), "organization_id": "crisisos-demo",
-        "disabled": False, "created_at": now_iso(),
+        "id": str(uuid.uuid4()),
+        "email": email,
+        "name": input.name.strip(),
+        "role": "CITIZEN",
+        "password_hash": hash_password(input.password),
+        "organization_id": "crisisos-demo",
+        "disabled": False,
+        "created_at": now_iso(),
         "mobile_number": input.mobile_number.strip(),
     }
     await db.users.insert_one(dict(doc))
@@ -636,7 +775,7 @@ async def login(input: LoginRequest, request: Request) -> TokenResponse:
     email = input.email.lower().strip()
     check_rate_limit(f"login:{email}")
     user = await db.users.find_one({"email": email}, {"_id": 0})
-    if not user or user.get("disabled", False) or not pwd_context.verify(input.password, user["password_hash"]):
+    if not user or user.get("disabled", False) or not verify_password(input.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Incorrect email or password", headers={"WWW-Authenticate": "Bearer"})
     return TokenResponse(access_token=make_token(user), user=auth_user(user))
 
@@ -665,27 +804,12 @@ async def reset_demo(user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> 
     await db.responders.delete_many({})
     await db.alerts.delete_many({})
     await db.media.delete_many({})
+    await db.operator_assignments.delete_many({})
+    await db.operator_locations.delete_many({})
     await seed_responders()
     await seed_users()
     await broadcast("demo.reset", {})
     return {"status": "reset"}
-
-
-def sign_media_path(path: str) -> dict[str, Any]:
-    expires = int(time.time()) + MEDIA_URL_TTL_SECONDS
-    signature = hmac.new(JWT_SECRET.encode(), f"{path}:{expires}".encode(), hashlib.sha256).hexdigest()[:40]
-    return {"url": f"/api/files/{path}?mt={signature}&exp={expires}", "expires_at": expires}
-
-
-async def assert_media_access(path: str, user: dict[str, Any]) -> dict[str, Any]:
-    media = await db.media.find_one({"storage_path": path}, {"_id": 0})
-    if not media:
-        raise HTTPException(status_code=404, detail="File not found")
-    if user.get("role") == "CITIZEN" and media.get("owner_id") != user["id"]:
-        attached = await db.incidents.find_one({"media.path": path, "reported_by": user["id"]})
-        if not attached:
-            raise HTTPException(status_code=403, detail="Insufficient permissions")
-    return media
 
 
 @api_router.get("/media/sign")
@@ -765,15 +889,22 @@ async def create_sos(input: SOSCreate, user: dict[str, Any] = Depends(get_curren
         if media:
             media_docs.append({"path": path, "content_type": media["content_type"]})
     doc = {
-        "id": incident_id, "sos_id": sos_id,
+        "id": incident_id,
+        "sos_id": sos_id,
         "title": f"{ai['type'].replace('_', ' ').title()} emergency",
         "description": input.description or "Citizen reported an emergency.",
-        "type": ai["type"], "status": "ACKNOWLEDGED", "severity": ai["severity"],
-        "location": input.location, "affected_people": input.affected_people,
-        "ai_analysis": ai, "media": media_docs, "reported_by": user["id"],
+        "type": ai["type"],
+        "status": "ACKNOWLEDGED",
+        "severity": ai["severity"],
+        "location": input.location,
+        "affected_people": input.affected_people,
+        "ai_analysis": ai,
+        "media": media_docs,
+        "reported_by": user["id"],
         "reported_by_mobile": user.get("mobile_number"),
         "assigned_responder_id": None,
-        "created_at": created_at, "updated_at": created_at,
+        "created_at": created_at,
+        "updated_at": created_at,
     }
     sos_doc = {"id": sos_id, "incident_id": incident_id, "idempotency_key": input.idempotency_key, "created_at": created_at}
     await db.sos.insert_one(sos_doc)
@@ -866,9 +997,15 @@ async def approve_dispatch(incident_id: str, input: DispatchApproval, user: dict
         return AssignmentResponse(**existing)
     timestamp = now_iso()
     assignment = {
-        "id": str(uuid.uuid4()), "incident_id": incident_id, "responder_id": input.responder_id,
-        "responder_name": responder["name"], "status": "ASSIGNED", "approved_by": user["email"],
-        "assigned_at": timestamp, "updated_at": timestamp, "note": "Human operator approved dispatch.",
+        "id": str(uuid.uuid4()),
+        "incident_id": incident_id,
+        "responder_id": input.responder_id,
+        "responder_name": responder["name"],
+        "status": "ASSIGNED",
+        "approved_by": user["email"],
+        "assigned_at": timestamp,
+        "updated_at": timestamp,
+        "note": "Human operator approved dispatch.",
     }
     await db.assignments.insert_one(dict(assignment))
     await db.incidents.update_one({"id": incident_id}, {"$set": {"status": "ACTIVE_RESPONSE", "assigned_responder_id": input.responder_id, "updated_at": timestamp}})
@@ -891,8 +1028,12 @@ async def update_assignment(assignment_id: str, input: AssignmentStatusUpdate, u
     if not assignment:
         raise HTTPException(status_code=404, detail="Assignment not found")
     allowed = {
-        "ASSIGNED": {"ACCEPTED", "CANCELLED"}, "ACCEPTED": {"EN_ROUTE", "CANCELLED"},
-        "EN_ROUTE": {"ON_SCENE", "CANCELLED"}, "ON_SCENE": {"COMPLETED"}, "COMPLETED": set(), "CANCELLED": set(),
+        "ASSIGNED": {"ACCEPTED", "CANCELLED"},
+        "ACCEPTED": {"EN_ROUTE", "CANCELLED"},
+        "EN_ROUTE": {"ON_SCENE", "CANCELLED"},
+        "ON_SCENE": {"COMPLETED"},
+        "COMPLETED": set(),
+        "CANCELLED": set(),
     }
     if input.status not in allowed.get(assignment["status"], set()):
         raise HTTPException(status_code=409, detail=f"Cannot move from {assignment['status']} to {input.status}")
@@ -912,9 +1053,14 @@ async def update_assignment(assignment_id: str, input: AssignmentStatusUpdate, u
 @api_router.post("/alerts", response_model=AlertResponse, status_code=201)
 async def publish_alert(input: AlertCreate, user: dict[str, Any] = Depends(require_roles("OPERATOR", "ADMIN"))) -> AlertResponse:
     doc = {
-        "id": str(uuid.uuid4()), "title": input.title.strip(), "message": input.message.strip(),
-        "severity": input.severity, "radius_km": input.radius_km,
-        "created_by": user["email"], "created_at": now_iso(), "active": True,
+        "id": str(uuid.uuid4()),
+        "title": input.title.strip(),
+        "message": input.message.strip(),
+        "severity": input.severity,
+        "radius_km": input.radius_km,
+        "created_by": user["email"],
+        "created_at": now_iso(),
+        "active": True,
     }
     await db.alerts.insert_one(dict(doc))
     await audit("ALERT_PUBLISHED", user["email"], doc["id"], f"Alert: {doc['title']}")
@@ -998,9 +1144,16 @@ async def get_nearest_incidents(
     user: dict[str, Any] = Depends(require_roles("OPERATOR", "ADMIN")),
 ) -> list[NearestIncidentResponse]:
     """Get nearest unassigned SOS incidents to operator's location."""
+    timestamp = now_iso()
+    geojson_location = {"type": "Point", "coordinates": [lon, lat], "timestamp": timestamp}
+    history_entry = {"location": geojson_location, "timestamp": timestamp, "updated_at": timestamp}
+
     await db.operator_locations.update_one(
         {"operator_id": user["id"]},
-        {"$set": {"operator_id": user["id"], "coordinates": [lon, lat], "updated_at": now_iso()}},
+        {
+            "$set": {"operator_id": user["id"], "location": geojson_location, "updated_at": timestamp},
+            "$push": {"location_history": history_entry},
+        },
         upsert=True,
     )
 
@@ -1014,6 +1167,7 @@ async def get_nearest_incidents(
                 "query": {
                     "status": {"$nin": ["RESOLVED", "CLOSED", "CANCELLED"]},
                     "assigned_responder_id": None,
+                    "location.coordinates": {"$ne": None},
                 },
             }
         },
@@ -1149,7 +1303,7 @@ async def update_operator_location(
         {"operator_id": user["id"]},
         {
             "$set": {"operator_id": user["id"], "location": input.location, "updated_at": timestamp},
-            "$push": {"location_history": history_entry}
+            "$push": {"location_history": history_entry},
         },
         upsert=True,
     )
@@ -1173,7 +1327,7 @@ async def get_operator_location_history(user: dict[str, Any] = Depends(require_r
         "operator_id": user["id"],
         "current_location": doc.get("location"),
         "total_past_locations": len(history),
-        "location_history": history[-200:]
+        "location_history": history[-200:],
     }
 
 
@@ -1253,20 +1407,3 @@ async def locate_citizen(
 
 app.include_router(api_router)
 app.add_middleware(CORSMiddleware, allow_credentials=False, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-
-@app.on_event("startup")
-async def startup() -> None:
-    await ensure_indexes()
-    await seed_responders()
-    await seed_users()
-    try:
-        await run_in_threadpool(init_storage)
-        logger.info("object storage initialized")
-    except Exception as exc:
-        logger.warning("object storage init failed (uploads will retry on demand): %s", exc)
-
-
-@app.on_event("shutdown")
-async def shutdown_db_client() -> None:
-    client.close()
