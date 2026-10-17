@@ -4,7 +4,6 @@
   "version": "1.0.0",
   "scripts": {
     "build": "npx expo export -p web",
-    "preinstall": "./scripts/cmd-guard.js --preinstall",
     "start": "expo start",
     "reset-project": "node ./scripts/reset-project.js",
     "android": "expo start --android",
